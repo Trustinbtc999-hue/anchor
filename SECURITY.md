@@ -6,9 +6,11 @@
 
 ## Reporting security problems for Anchor
 
-**DO NOT CREATE A GITHUB ISSUE** to report a security problem.
+**DO NOT CREATE A PUBLIC GITHUB ISSUE** to report a security problem.
 
-Instead please email anchor-security@solana.org. Provide a helpful title, detailed description of the vulnerability and an exploit proof-of-concept. Speculative submissions without proof-of-concept will be closed with no further consideration.
+Instead, please submit a draft security advisory through GitHub [here](https://github.com/otter-sec/anchor/security/advisories/new).
+
+Provide a helpful title, detailed description of the vulnerability and an exploit proof-of-concept. Speculative submissions without proof-of-concept will be closed with no further consideration.
 
 If you haven't done so already, please **enable two-factor auth** in your GitHub account.
 
@@ -21,11 +23,48 @@ As a general rule of thumb, we will look to these questions to evaluate eligibil
 
 Regardless, if you think you have an issue, we'd like to hear about it.
 
-For bugs that affect production code, we will pay up to X SOL tokens according to the following guidelines. This is exclusive to any bounties claimed from the protocol. In other words, reports can't double-dip.
+For bugs that affect production code, we will pay SOL tokens according to the following guidelines. This is exclusive to any bounties claimed from the protocol. In other words, reports can't double-dip.
 
 ---
 
 If you do not receive a response in the advisory, send an email to anchor-security@solana.org with the full URL of the advisory you have created. DO NOT include attachments or provide detail sufficient for exploitation regarding the security issue in this email. **Only provide such details in the advisory**.
+
+## Security boundaries
+
+Not every safety check performed by Anchor is a security boundary.
+
+Some checks are defense-in-depth or anti-footgun measures intended to
+prevent accidental misuse, improve developer experience, or catch
+incorrect program behavior early. A failure of such a check does not
+necessarily represent a vulnerability in Anchor.
+
+A security-boundary issue is one where an attacker can bypass a
+fundamental security property that Anchor is responsible for enforcing,
+such as:
+
+- account ownership validation
+- account discriminator validation
+- signer/authentication requirements enforced by Anchor
+- memory-safety guarantees
+- other fundamental invariants enforced by the Anchor framework
+
+By contrast, protections that primarily prevent accidental misuse,
+developer mistakes, or incorrect program construction should generally
+be considered defense-in-depth or anti-footgun measures rather than
+security boundaries. For example, duplicate mutable account checks help
+prevent multiple mutable references to the same account in an
+instruction, but bypassing this check is not by itself a security
+boundary violation.
+
+Compile-time checks that are part of the IDL building process are also
+not security boundaries when they can be bypassed by disabling IDL
+generation with `--no-idl`. These checks can help catch incorrect
+program definitions during development, but they do not enforce a
+security property at runtime.
+
+If you are unsure whether an issue crosses a security boundary, please
+report it through the security reporting process with a proof of concept
+and let the security team determine its classification.
 
 ## Incident Response Process
 

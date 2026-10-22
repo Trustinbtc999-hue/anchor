@@ -63,9 +63,9 @@ use {proc_macro::TokenStream, quote::ToTokens, syn::parse_macro_input};
 ///                 Example:
 ///                 <pre><code>
 /// #[account(signer)]
-/// pub authority: AccountInfo&lt;'info&gt;,
+/// pub authority: UncheckedAccount&lt;'info&gt;,
 /// #[account(signer @ MyError::MyErrorCode)]
-/// pub payer: AccountInfo&lt;'info&gt;
+/// pub payer: UncheckedAccount&lt;'info&gt;
 ///                 </code></pre>
 ///             </td>
 ///         </tr>
@@ -190,13 +190,13 @@ use {proc_macro::TokenStream, quote::ToTokens, syn::parse_macro_input};
 /// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;init, payer = payer,
 /// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;space = 8 + 8, owner = other_program.key()
 /// &nbsp;&nbsp;&nbsp;&nbsp;)]
-/// &nbsp;&nbsp;&nbsp;&nbsp;pub account_for_other_program: AccountInfo&lt;'info&gt;,
+/// &nbsp;&nbsp;&nbsp;&nbsp;pub account_for_other_program: UncheckedAccount&lt;'info&gt;,
 /// &nbsp;&nbsp;&nbsp;&nbsp;#[account(
 /// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;init, payer = payer, space = 8 + 8,
 /// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;owner = other_program.key(),
 /// &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;seeds = [b"other_seed"], bump
 /// &nbsp;&nbsp;&nbsp;&nbsp;)]
-/// &nbsp;&nbsp;&nbsp;&nbsp;pub pda_for_other_program: AccountInfo&lt;'info&gt;,
+/// &nbsp;&nbsp;&nbsp;&nbsp;pub pda_for_other_program: UncheckedAccount&lt;'info&gt;,
 /// &nbsp;&nbsp;&nbsp;&nbsp;#[account(mut)]
 /// &nbsp;&nbsp;&nbsp;&nbsp;pub payer: Signer&lt;'info&gt;,
 /// &nbsp;&nbsp;&nbsp;&nbsp;pub system_program: Program&lt;'info, System&gt;,
@@ -271,21 +271,21 @@ use {proc_macro::TokenStream, quote::ToTokens, syn::parse_macro_input};
 /// #[instruction(first_bump: u8, second_bump: u8)]
 /// pub struct Example {
 ///     #[account(seeds = [b"example_seed"], bump)]
-///     pub canonical_pda: AccountInfo&lt;'info&gt;,
+///     pub canonical_pda: UncheckedAccount&lt;'info&gt;,
 ///     #[account(
 ///         seeds = [b"example_seed"],
 ///         bump,
 ///         seeds::program = other_program.key()
 ///     )]
-///     pub canonical_pda_two: AccountInfo&lt;'info&gt;,
+///     pub canonical_pda_two: UncheckedAccount&lt;'info&gt;,
 ///     #[account(seeds = [b"other_seed"], bump = first_bump)]
-///     pub arbitrary_pda: AccountInfo&lt;'info&gt;
+///     pub arbitrary_pda: UncheckedAccount&lt;'info&gt;
 ///     #[account(
 ///         seeds = [b"other_seed"],
 ///         bump = second_bump,
 ///         seeds::program = other_program.key()
 ///     )]
-///     pub arbitrary_pda_two: AccountInfo&lt;'info&gt;,
+///     pub arbitrary_pda_two: UncheckedAccount&lt;'info&gt;,
 ///     pub other_program: Program&lt;'info, OtherProgram&gt;
 /// }
 ///                 </code></pre>
@@ -334,12 +334,17 @@ use {proc_macro::TokenStream, quote::ToTokens, syn::parse_macro_input};
 ///             <td>
 ///                 Checks the account owner matches <code>expr</code>.<br>
 ///                 Custom errors are supported via <code>@</code>.<br><br>
+///                 This constraint cannot override the owner of an account type implementing
+///                 <code>Owner</code>. For example, <code>Account&lt;T&gt;</code> checks
+///                 <code>T::owner()</code> first and rejects a different owner.<br><br>
 ///                 Example:
 ///                 <pre><code>
+/// /// CHECK: Only the account owner is checked.
 /// #[account(owner = Token::ID @ MyError::MyErrorCode)]
-/// pub data: Account&lt;'info, MyData&gt;,
+/// pub data: UncheckedAccount&lt;'info&gt;,
+/// /// CHECK: Only the account owner is checked.
 /// #[account(owner = token_program.key())]
-/// pub data_two: Account&lt;'info, MyData&gt;,
+/// pub data_two: UncheckedAccount&lt;'info&gt;,
 /// pub token_program: Program&lt;'info, Token&gt;
 ///                 </code></pre>
 ///             </td>
@@ -534,7 +539,10 @@ use {proc_macro::TokenStream, quote::ToTokens, syn::parse_macro_input};
 ///             <td>
 ///                 Can be used as a check or with <code>init</code> to create a mint
 ///                 account with the given mint decimals and mint authority.<br>
-///                 The freeze authority is optional when used with <code>init</code>.<br>
+///                 The freeze authority is optional when used with <code>init</code>.
+///                 <code>mint::authority = None</code> cannot be combined with
+///                 <code>init</code> because SPL Token requires a mint authority
+///                 at initialization.<br>
 ///                 When used as a check, it's possible to only specify a subset of the constraints.
 ///                 <br><br>
 ///                 Example:

@@ -28,7 +28,7 @@ jobs:
       - name: Force fetch upstream tags
         run: git fetch --tags --force
 
-      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
         with:
           toolchain: stable
 
@@ -112,9 +112,10 @@ jobs:
         run: |
           set -xeou pipefail
 
-          cd ts/packages/borsh && yarn --frozen-lockfile && yarn build && yarn link --force && cd ../../../
-          cd ts/packages/anchor-errors && yarn --frozen-lockfile && yarn build && yarn link --force && cd ../../../
-          cd ts/packages/anchor && yarn --frozen-lockfile && yarn build:node && yarn link && cd ../../../
+          cd ts && yarn --frozen-lockfile && cd ..
+          cd ts/packages/borsh && yarn build && yarn link --force && cd ../../../
+          cd ts/packages/anchor-errors && yarn build && yarn link --force && cd ../../../
+          cd ts/packages/anchor && yarn build:node && yarn link && cd ../../../
 
           cd ts/packages/anchor/
           yarn docs

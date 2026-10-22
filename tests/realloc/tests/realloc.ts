@@ -12,10 +12,15 @@ describe("realloc", () => {
     .payer as anchor.web3.Keypair;
 
   let sample: anchor.web3.PublicKey;
+  let payer: anchor.web3.PublicKey;
 
   before(async () => {
     [sample] = await anchor.web3.PublicKey.findProgramAddress(
       [Buffer.from("sample")],
+      program.programId
+    );
+    [payer] = await anchor.web3.PublicKey.findProgramAddress(
+      [Buffer.from("payer")],
       program.programId
     );
   });
@@ -48,6 +53,16 @@ describe("realloc", () => {
     }
   });
 
+  it("initializes boxed realloc payer", async () => {
+    await program.methods
+      .initializeBoxPayer()
+      .accounts({ authority: authority.publicKey, payer })
+      .rpc();
+
+    const payerAccount = await program.account.sample.fetch(payer);
+    assert.lengthOf(payerAccount.data, 1);
+  });
+
   it("realloc additive", async () => {
     await program.methods
       .realloc(5)
@@ -63,6 +78,41 @@ describe("realloc", () => {
       .realloc(1)
       .accounts({ authority: authority.publicKey, sample })
       .rpc();
+
+    const s = await program.account.sample.fetch(sample);
+    assert.lengthOf(s.data, 1);
+  });
+
+  it("realloc subtractive with boxed payer", async () => {
+    await program.methods
+      .realloc(5)
+      .accounts({ authority: authority.publicKey, sample })
+      .rpc();
+
+    const beforeSample = await program.provider.connection.getAccountInfo(
+      sample
+    );
+    const beforePayer = await program.provider.connection.getAccountInfo(payer);
+    assert.isNotNull(beforeSample);
+    assert.isNotNull(beforePayer);
+
+    await program.methods
+      .reallocBoxPayer(1)
+      .accounts({
+        authority: authority.publicKey,
+        sample,
+        payer,
+      })
+      .rpc();
+
+    const afterSample = await program.provider.connection.getAccountInfo(
+      sample
+    );
+    const afterPayer = await program.provider.connection.getAccountInfo(payer);
+    assert.isNotNull(afterSample);
+    assert.isNotNull(afterPayer);
+    assert.isBelow(afterSample!.lamports, beforeSample!.lamports);
+    assert.isAbove(afterPayer!.lamports, beforePayer!.lamports);
 
     const s = await program.account.sample.fetch(sample);
     assert.lengthOf(s.data, 1);
@@ -85,6 +135,23 @@ describe("realloc", () => {
         "The account was duplicated for more than one reallocation";
       assert.strictEqual(err.error.errorMessage, errMsg);
       assert.strictEqual(err.error.errorCode.number, 3017);
+    }
+  });
+
+  it("fails when realloc payer matches target", async () => {
+    try {
+      await program.methods.reallocSelfPayer(5).accounts({ sample }).rpc();
+      assert.ok(false);
+    } catch (e) {
+      const err = e as Error & { logs?: string[] };
+      assert.include(err.message, "invalid program argument");
+      assert.isTrue(
+        err.logs?.some((log) =>
+          log.includes(
+            "ProgramError caused by account: sample. Error Code: InvalidArgument"
+          )
+        ) ?? false
+      );
     }
   });
 });

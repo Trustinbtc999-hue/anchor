@@ -4,7 +4,7 @@ use {
         IdlInstructionAccounts, IdlRepr, IdlSerialization, IdlType, IdlTypeDef, IdlTypeDefGeneric,
         IdlTypeDefTy,
     },
-    heck::{CamelCase, SnakeCase},
+    heck::{ToSnakeCase, ToUpperCamelCase},
     proc_macro2::Literal,
     quote::{format_ident, quote},
 };
@@ -28,6 +28,23 @@ pub fn gen_discriminator(disc: &[u8]) -> proc_macro2::TokenStream {
     quote! { [#(#disc), *] }
 }
 
+/// Whether the accounts struct generated for `accounts` carries an `<'info>`
+/// lifetime.
+///
+/// It does only when some field binds the lifetime: a plain account always does,
+/// a composite does when it is not itself lifetime-free. A struct with no fields
+/// (or only fieldless composites) gets no lifetime, so that it stays
+/// constructible as `Foo {}` and does not trip `E0392`.
+///
+/// Every site that names one of these structs must agree with this, or the
+/// generated code fails with `E0107`.
+pub fn accounts_use_lifetime(accounts: &[IdlInstructionAccountItem]) -> bool {
+    accounts.iter().any(|acc| match acc {
+        IdlInstructionAccountItem::Single(_) => true,
+        IdlInstructionAccountItem::Composite(accs) => accounts_use_lifetime(&accs.accounts),
+    })
+}
+
 pub fn gen_accounts_common(idl: &Idl, prefix: &str) -> proc_macro2::TokenStream {
     let re_exports = idl
         .instructions
@@ -46,7 +63,7 @@ fn gen_accounts_mod_name(prefix: &str, name: &str) -> String {
     format!(
         "__{}_accounts_{}",
         prefix,
-        name.to_camel_case().to_snake_case()
+        name.to_upper_camel_case().to_snake_case()
     )
 }
 
@@ -81,11 +98,27 @@ pub fn convert_idl_type_to_str(ty: &IdlType, is_const: bool) -> Result<String, s
         IdlType::I128 => "i128".into(),
         IdlType::U256 => "u256".into(),
         IdlType::I256 => "i256".into(),
-        IdlType::Bytes => if is_const { "&[u8]" } else { "Vec<u8>" }.into(),
-        IdlType::String => if is_const { "&str" } else { "String" }.into(),
-        IdlType::Pubkey => "Pubkey".into(),
-        IdlType::Option(ty) => format!("Option<{}>", convert_idl_type_to_str(ty, is_const)?),
-        IdlType::Vec(ty) => format!("Vec<{}>", convert_idl_type_to_str(ty, is_const)?),
+        IdlType::Bytes => if is_const {
+            "&[u8]"
+        } else {
+            "::std::vec::Vec<u8>"
+        }
+        .into(),
+        IdlType::String => if is_const {
+            "&str"
+        } else {
+            "::std::string::String"
+        }
+        .into(),
+        IdlType::Pubkey => "anchor_lang::prelude::Pubkey".into(),
+        IdlType::Option(ty) => format!(
+            "::core::option::Option<{}>",
+            convert_idl_type_to_str(ty, is_const)?
+        ),
+        IdlType::Vec(ty) => format!(
+            "::std::vec::Vec<{}>",
+            convert_idl_type_to_str(ty, is_const)?
+        ),
         IdlType::Array(ty, len) => format!(
             "[{}; {}]",
             convert_idl_type_to_str(ty, is_const)?,
@@ -835,11 +868,17 @@ mod tests {
         assert_eq!(s(&IdlType::Bool), "bool");
         assert_eq!(s(&IdlType::U8), "u8");
         assert_eq!(s(&IdlType::U64), "u64");
-        assert_eq!(s(&IdlType::String), "String");
-        assert_eq!(s(&IdlType::Pubkey), "Pubkey");
+        assert_eq!(s(&IdlType::String), "::std::string::String");
+        assert_eq!(s(&IdlType::Pubkey), "anchor_lang::prelude::Pubkey");
 
-        assert_eq!(s(&IdlType::Option(Box::new(IdlType::U64))), "Option<u64>");
-        assert_eq!(s(&IdlType::Vec(Box::new(IdlType::String))), "Vec<String>");
+        assert_eq!(
+            s(&IdlType::Option(Box::new(IdlType::U64))),
+            "::core::option::Option<u64>"
+        );
+        assert_eq!(
+            s(&IdlType::Vec(Box::new(IdlType::String))),
+            "::std::vec::Vec<::std::string::String>"
+        );
 
         assert_eq!(
             s(&IdlType::Array(

@@ -1,11 +1,12 @@
 use {
     crate::{
-        config::ProgramWorkspace, create_files, override_or_create_files, AbsolutePath, Files,
-        PackageManager, VERSION,
+        compat::solana_pubkey, config::ProgramWorkspace, create_files, override_or_create_files,
+        AbsolutePath, Files, PackageManager, VERSION,
     },
     anyhow::Result,
     clap::{Parser, ValueEnum},
     heck::{ToLowerCamelCase, ToPascalCase, ToSnakeCase},
+    serde_json::{json, Value},
     solana_keypair::{read_keypair_file, write_keypair_file, Keypair},
     solana_pubkey::Pubkey,
     solana_signer::Signer,
@@ -19,7 +20,9 @@ use {
 };
 
 const ANCHOR_MSRV: &str = "1.89.0";
-const ANCHOR_V2_TEMPLATE_VERSION: &str = "2.0.0";
+const ANCHOR_V2_TEMPLATE_VERSION: &str = "2.0.0-rc.2";
+// Host-side v2 tests depend on Agave and LiteSVM from anchor-next, which require newer Rust.
+const ANCHOR_V2_HOST_RUST_VERSION: &str = "1.97.1";
 
 /// Anchor template version to generate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Parser, ValueEnum, AbsolutePath)]
@@ -50,9 +53,12 @@ pub fn create_program(
 ) -> Result<()> {
     let program_path = Path::new("programs").join(name);
     let lib_rs_path = program_path.join("src").join("lib.rs");
-    let common_files = vec![
+    let mut common_files = vec![
         ("Cargo.toml".into(), workspace_manifest()),
-        ("rust-toolchain.toml".into(), rust_toolchain_toml()),
+        (
+            "rust-toolchain.toml".into(),
+            rust_toolchain_toml(anchor_version),
+        ),
         (
             program_path.join("Cargo.toml"),
             cargo_toml(name, test_template, anchor_version),
@@ -63,6 +69,11 @@ pub fn create_program(
         (lib_rs_path.clone(), "".into()),
         // Note: Xargo.toml is no longer needed for modern Solana builds using SBF.
     ];
+
+    if anchor_version == AnchorVersion::V1 && matches!(test_template, Some(&TestTemplate::Litesvm))
+    {
+        common_files.push(("Cargo.lock".into(), litesvm_cargo_lock(name)));
+    }
 
     create_files(&common_files)?;
 
@@ -88,10 +99,14 @@ pub fn create_program(
 }
 
 /// Helper to create a rust-toolchain.toml at the workspace root
-fn rust_toolchain_toml() -> String {
+fn rust_toolchain_toml(anchor_version: AnchorVersion) -> String {
+    let channel = match anchor_version {
+        AnchorVersion::V1 => ANCHOR_MSRV,
+        AnchorVersion::V2 => ANCHOR_V2_HOST_RUST_VERSION,
+    };
     format!(
         r#"[toolchain]
-channel = "{ANCHOR_MSRV}"
+channel = "{channel}"
 components = ["rustfmt","clippy"]
 profile = "minimal"
 "#
@@ -227,7 +242,7 @@ fn create_program_template_single_v2(name: &str, program_path: &Path, target_pat
     vec![(
         program_path.join("src").join("lib.rs"),
         format!(
-            r#"use anchor_lang_v2::prelude::*;
+            r#"use anchor_lang::prelude::*;
 
 declare_id!("{}");
 
@@ -462,7 +477,7 @@ pub mod error;
 pub mod instructions;
 pub mod state;
 
-use anchor_lang_v2::prelude::*;
+use anchor_lang::prelude::*;
 
 pub use instructions::*;
 
@@ -483,7 +498,7 @@ pub mod {} {{
         ),
         (
             src_path.join("constants.rs"),
-            r#"use anchor_lang_v2::prelude::*;
+            r#"use anchor_lang::prelude::*;
 
 #[constant]
 pub const SEED: &str = "anchor";
@@ -492,7 +507,7 @@ pub const SEED: &str = "anchor";
         ),
         (
             src_path.join("error.rs"),
-            r#"use anchor_lang_v2::prelude::*;
+            r#"use anchor_lang::prelude::*;
 
 #[error_code]
 pub enum ErrorCode {
@@ -512,7 +527,7 @@ pub use initialize::*;
         ),
         (
             src_path.join("instructions").join("initialize.rs"),
-            r#"use anchor_lang_v2::prelude::*;
+            r#"use anchor_lang::prelude::*;
 
 use crate::state::Counter;
 
@@ -536,7 +551,7 @@ pub fn handler(ctx: &mut Context<Initialize>) -> Result<()> {
         ),
         (
             src_path.join("state.rs"),
-            r#"use anchor_lang_v2::prelude::*;
+            r#"use anchor_lang::prelude::*;
 
 #[account]
 pub struct Counter {
@@ -602,11 +617,12 @@ solana-sdk-ids = "3"
         Some(TestTemplate::Litesvm) => {
             r#"
 [dev-dependencies]
-litesvm = "0.10.0"
-solana-message = "3.0.1"
-solana-transaction = "3.0.2"
-solana-signer = "3.0.0"
-solana-keypair = "3.0.1"
+# Cargo.lock pins LiteSVM's Rust-1.89-compatible dependency graph.
+litesvm = "0.15.0"
+solana-message = "4"
+solana-transaction = "4"
+solana-signer = "3"
+solana-keypair = "3"
 "#
         }
         _ => "",
@@ -648,6 +664,10 @@ unexpected_cfgs = {{ level = "warn", check-cfg = ['cfg(target_os, values("solana
         VERSION,
         dev_dependencies,
     )
+}
+
+fn litesvm_cargo_lock(name: &str) -> String {
+    include_str!("../templates/litesvm/Cargo.lock").replace("anchor_litesvm_template", name)
 }
 
 fn cargo_toml_v2(name: &str, test_template: Option<&TestTemplate>) -> String {
@@ -701,8 +721,8 @@ idl-build = []
 {2}
 
 [dependencies]
-# Once anchor-lang-v2 is published to crates.io, swap to: anchor-lang-v2 = "{3}"
-anchor-lang-v2 = {{ git = "https://github.com/otter-sec/anchor.git", branch = "anchor-next" }}
+# Once Anchor v2 is published to crates.io, swap to: anchor-lang = "{3}"
+anchor-lang = {{ git = "https://github.com/otter-sec/anchor.git", branch = "anchor-next" }}
 solana-program-log = {{ version = "1.1", features = ["macro"] }}
 wincode = {{ version = "0.5", features = ["derive"] }}
 {4}
@@ -1014,7 +1034,8 @@ fn package_json_v2(jest: bool, license: String) -> String {
   "license": "{license}",
   "scripts": {{
     "lint:fix": "prettier */*.js \"*/**/*{{.js,.ts}}\" -w",
-    "lint": "prettier */*.js \"*/**/*{{.js,.ts}}\" --check"
+    "lint": "prettier */*.js \"*/**/*{{.js,.ts}}\" --check",
+    "tsx": "tsx"
   }},
   "dependencies": {{
     "@anchor-lang/core": "^1.0.0"
@@ -1084,6 +1105,7 @@ fn ts_package_json_v1(jest: bool, license: String) -> String {
     "jest": "^29.0.3",
     "prettier": "^2.6.2",
     "ts-jest": "^29.0.2",
+    "tsx": "^4.19.0",
     "typescript": "^5.7.3"
   }},
   "overrides": {{
@@ -1106,7 +1128,8 @@ fn ts_package_json_v1(jest: bool, license: String) -> String {
   "license": "{license}",
   "scripts": {{
     "lint:fix": "prettier */*.js \"*/**/*{{.js,.ts}}\" -w",
-    "lint": "prettier */*.js \"*/**/*{{.js,.ts}}\" --check"
+    "lint": "prettier */*.js \"*/**/*{{.js,.ts}}\" --check",
+    "tsx": "tsx"
   }},
   "dependencies": {{
     "@anchor-lang/core": "^{VERSION}"
@@ -1114,10 +1137,10 @@ fn ts_package_json_v1(jest: bool, license: String) -> String {
   "devDependencies": {{
     "chai": "^4.3.4",
     "mocha": "^9.0.3",
-    "ts-mocha": "^10.0.0",
     "@types/bn.js": "^5.1.0",
     "@types/chai": "^4.3.0",
     "@types/mocha": "^9.0.0",
+    "tsx": "^4.19.0",
     "typescript": "^5.7.3",
     "prettier": "^2.6.2"
   }}
@@ -1176,12 +1199,11 @@ fn ts_package_json_v2(jest: bool, license: String) -> String {
   "devDependencies": {{
     "chai": "^4.5.0",
     "mocha": "^11.7.5",
-    "ts-mocha": "^11.1.0",
-    "ts-node": "^10.9.2",
     "@types/bn.js": "^5.2.0",
     "@types/chai": "^4.3.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.6.0",
+    "tsx": "^4.19.0",
     "typescript": "^5.9.3",
     "prettier": "^3.8.3"
   }}
@@ -1191,14 +1213,14 @@ fn ts_package_json_v2(jest: bool, license: String) -> String {
     }
 }
 
-pub fn ts_mocha(name: &str, anchor_version: AnchorVersion) -> String {
+pub fn typescript_test(name: &str, anchor_version: AnchorVersion) -> String {
     match anchor_version {
-        AnchorVersion::V1 => ts_mocha_v1(name),
-        AnchorVersion::V2 => ts_mocha_v2(name),
+        AnchorVersion::V1 => typescript_test_v1(name),
+        AnchorVersion::V2 => typescript_test_v2(name),
     }
 }
 
-fn ts_mocha_v1(name: &str) -> String {
+fn typescript_test_v1(name: &str) -> String {
     format!(
         r#"import * as anchor from "@anchor-lang/core";
 import {{ Program }} from "@anchor-lang/core";
@@ -1238,7 +1260,7 @@ describe("{}", () => {{
     )
 }
 
-fn ts_mocha_v2(name: &str) -> String {
+fn typescript_test_v2(name: &str) -> String {
     format!(
         r#"import * as anchor from "@anchor-lang/core";
 import {{ Program }} from "@anchor-lang/core";
@@ -1485,7 +1507,7 @@ impl TestTemplate {
                     format!("{pkg_manager_exec_cmd} mocha -t 1000000 tests/")
                 } else {
                     format!(
-                        r#"{pkg_manager_exec_cmd} ts-mocha -p ./tsconfig.json -t 1000000 "tests/**/*.ts""#
+                        r#"{pkg_manager_exec_cmd} mocha --import=tsx -t 1000000 "tests/**/*.ts""#
                     )
                 }
             }
@@ -1518,7 +1540,7 @@ impl TestTemplate {
                     test.write_all(mocha(project_name, anchor_version).as_bytes())?;
                 } else {
                     let mut mocha = File::create(format!("tests/{}.ts", project_name))?;
-                    mocha.write_all(ts_mocha(project_name, anchor_version).as_bytes())?;
+                    mocha.write_all(typescript_test(project_name, anchor_version).as_bytes())?;
                 }
             }
             Self::Jest => {
@@ -1907,7 +1929,7 @@ fn create_program_template_mollusk_test_v2(name: &str, tests_path: &Path) -> Fil
             r#"#![cfg(feature = "test-sbf")]
 
 use {{
-    anchor_lang_v2::{{
+    anchor_lang::{{
         accounts::Account, solana_program::instruction::Instruction, InstructionData, Space,
         ToAccountMetas,
     }},
@@ -2074,7 +2096,7 @@ fn create_program_template_litesvm_test_v2(name: &str, tests_path: &Path) -> Fil
         format!(
             r#"
 use {{
-    anchor_lang_v2::{{
+    anchor_lang::{{
         accounts::Account, bytemuck, programs::System,
         solana_program::instruction::Instruction, Id, InstructionData, Space, ToAccountMetas,
     }},
@@ -2137,32 +2159,74 @@ fn test_initialize() {{
     )]
 }
 
+pub fn get_security_metadata_content(project_name: &str) -> Value {
+    json!({
+        "name": project_name,
+        "logo": "https://solana.com/src/img/branding/solanaLogoMark.png",
+        "description": "A fresh Anchor program!",
+        "notification": "Remember to review and publish this metadata with `anchor program deploy --security-metadata` once the contents are accurate.",
+        "sdk": "https://github.com/your-sdk",
+        "project_url": "https://github.com/your-project/",
+        "contacts": [
+        "email:security@example.com",
+        "discord:MyProgram#1234",
+        "twitter:@MyProgram"
+        ],
+        "policy": "https://example.com/security-policy",
+        "preferred_languages": ["en", "de"],
+        "encryption": "https://example.com/pgp-key",
+        "source_code": "https://github.com/your-source-code/",
+        "source_release": "v0.1.0",
+        "source_revision": "abc123def456",
+        "auditors": ["Audit Firm A", "Security Researcher B"],
+        "acknowledgements": "https://example.com/security-acknowledgements",
+        "version": "0.1.0"
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn security_metadata_uses_canonical_solana_logo() {
+        let metadata = get_security_metadata_content("counter");
+
+        assert_eq!(
+            metadata["logo"],
+            "https://solana.com/src/img/branding/solanaLogoMark.png"
+        );
+    }
+
+    #[test]
     fn v1_templates_keep_legacy_anchor_lang_shape() {
         let manifest = cargo_toml("counter", Some(&TestTemplate::Litesvm), AnchorVersion::V1);
         assert!(manifest.contains("anchor-lang ="));
-        assert!(manifest.contains("litesvm = \"0.10.0\""));
+        assert!(manifest.contains("litesvm = \"0.15.0\""));
         assert!(!manifest.contains("anchor-lang-v2"));
 
-        let test = ts_mocha("counter", AnchorVersion::V1);
+        let test = typescript_test("counter", AnchorVersion::V1);
         assert!(test.contains("[Buffer.from(\"counter\")]"));
         assert!(test.contains(".accountsPartial({ counter })"));
         assert!(!test.contains("counter: counter.publicKey"));
+
+        let toolchain = rust_toolchain_toml(AnchorVersion::V1);
+        assert!(toolchain.contains("channel = \"1.89.0\""));
     }
 
     #[test]
     fn v2_templates_use_anchor_next_counter_shape() {
         let manifest = cargo_toml("counter", Some(&TestTemplate::Litesvm), AnchorVersion::V2);
-        assert!(manifest.contains("anchor-lang-v2 = { git = "));
+        assert!(manifest.contains("anchor-lang = { git = "));
+        assert!(!manifest.contains("anchor-lang-v2"));
         assert!(manifest.contains("profile = [\"anchor-v2-testing/profile\"]"));
         assert!(manifest.contains("anchor-v2-testing = { git = "));
 
-        let test = ts_mocha("counter", AnchorVersion::V2);
+        let test = typescript_test("counter", AnchorVersion::V2);
         assert!(test.contains("const counter = anchor.web3.Keypair.generate();"));
         assert!(test.contains("counter: counter.publicKey"));
+
+        let toolchain = rust_toolchain_toml(AnchorVersion::V2);
+        assert!(toolchain.contains("channel = \"1.97.1\""));
     }
 }
