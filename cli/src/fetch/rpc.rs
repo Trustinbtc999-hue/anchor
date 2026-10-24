@@ -170,9 +170,9 @@ pub(super) fn fetch_signatures_for_address(
 
     if cap_reached {
         eprintln!(
-            "warning: reached --max-signatures cap of {} for account {}; older history was not \
+            "warning: reached --max-signatures cap of {}; older history was not \
              scanned. Pass a higher --max-signatures to fetch more.",
-            max_signatures, address
+            max_signatures
         );
     }
 
