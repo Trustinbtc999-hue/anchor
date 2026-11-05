@@ -2,14 +2,14 @@ extern crate proc_macro;
 
 use {
     anchor_syn::{codegen::program::common::gen_discriminator, Overrides},
-    quote::{quote, quote_spanned, ToTokens},
+    quote::{quote, quote_spanned},
     syn::{
         parenthesized,
         parse::{Parse, ParseStream},
         parse_macro_input,
         spanned::Spanned,
         token::Paren,
-        Expr, Ident, LitStr, Token,
+        Ident, LitStr, Token,
     },
 };
 
@@ -17,30 +17,6 @@ mod id;
 
 #[cfg(feature = "lazy-account")]
 mod lazy;
-
-fn is_zero_lit(lit: &syn::Lit) -> bool {
-    match lit {
-        syn::Lit::Int(val) => val.base10_parse::<u128>().is_ok_and(|v| v == 0),
-        syn::Lit::Byte(val) => val.value() == 0,
-        syn::Lit::ByteStr(val) => val.value().iter().all(|byte| *byte == 0),
-        _ => false,
-    }
-}
-
-fn is_zeroed_discriminator(discr: &Expr) -> bool {
-    match discr {
-        Expr::Reference(syn::ExprReference { expr, .. })
-        | Expr::Paren(syn::ExprParen { expr, .. })
-        | Expr::Group(syn::ExprGroup { expr, .. }) => is_zeroed_discriminator(expr),
-        Expr::Lit(syn::ExprLit { lit, .. }) => is_zero_lit(lit),
-        Expr::Array(arr) => arr.elems.iter().all(is_zeroed_discriminator),
-        // [0; N] is all zeroed for any N, and [X; 0] is empty.
-        Expr::Repeat(rep) => {
-            is_zeroed_discriminator(&rep.expr) || is_zeroed_discriminator(&rep.len)
-        }
-        _ => false,
-    }
-}
 
 /// An attribute for a data structure representing a Solana account.
 ///
@@ -139,13 +115,25 @@ pub fn account(
 
     let discriminator = match args.overrides.and_then(|ov| ov.discriminator) {
         Some(discrim) => {
-            let zero_err = is_zeroed_discriminator(&discrim).then(||
-                quote_spanned! {discrim.span() => compile_error!("all-zero or empty discriminators are not supported");}
-            );
-            quote! {
+            quote_spanned! {discrim.span() =>
                 {
-                    #zero_err
-                    #discrim
+                    let discriminator = #discrim;
+                    if discriminator.is_empty() {
+                        panic!("all-zero or empty discriminators are not supported");
+                    }
+
+                    let mut i = 0;
+                    while i < discriminator.len() {
+                        if discriminator[i] != 0 {
+                            break;
+                        }
+                        i += 1;
+                    }
+
+                    if i == discriminator.len() {
+                        panic!("all-zero or empty discriminators are not supported");
+                    }
+                    discriminator
                 }
             }
         }
@@ -355,9 +343,7 @@ impl Parse for AccountArg {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         // Namespace
         if let Ok(ns) = input.parse::<LitStr>() {
-            return Ok(Self::Namespace(
-                ns.to_token_stream().to_string().replace('\"', ""),
-            ));
+            return Ok(Self::Namespace(ns.value()));
         }
 
         // Zero copy
@@ -556,14 +542,15 @@ pub fn zero_copy(
         if !attr.path().is_ident("derive") {
             continue;
         }
-        if let syn::Meta::List(list) = &attr.meta {
-            let tokens_str = list.tokens.to_string();
-            if tokens_str.contains("bytemuck :: Pod") {
+        if let Err(err) = attr.parse_nested_meta(|meta| {
+            if ends_with_bytemuck_derive(&meta.path, "Pod") {
                 has_pod_attr = true;
-            }
-            if tokens_str.contains("bytemuck :: Zeroable") {
+            } else if ends_with_bytemuck_derive(&meta.path, "Zeroable") {
                 has_zeroable_attr = true;
             }
+            Ok(())
+        }) {
+            return err.into_compile_error().into();
         }
     }
 
@@ -592,15 +579,16 @@ pub fn zero_copy(
 
     #[cfg(feature = "idl-build")]
     {
-        let derive_unsafe = if is_unsafe {
-            // Not a real proc-macro but exists in order to pass the serialization info
+        // Not real proc-macros but exist in order to pass the serialization info,
+        // whichever path the user's own bytemuck derives were written with
+        let derive_serialization = if is_unsafe {
             quote! { #[derive(bytemuck::Unsafe)] }
         } else {
-            quote! {}
+            quote! { #[derive(bytemuck::Pod)] }
         };
 
         let zc_struct = syn::parse_quote! {
-            #derive_unsafe
+            #derive_serialization
             #ret
         };
         let idl_build_impl = anchor_syn::idl::impl_idl_build_struct(&zc_struct);
@@ -612,6 +600,16 @@ pub fn zero_copy(
 
     #[allow(unreachable_code)]
     proc_macro::TokenStream::from(ret)
+}
+
+// Any path ending in `bytemuck::<leaf>`, so re-exports like `crate::bytemuck::Pod` count.
+fn ends_with_bytemuck_derive(path: &syn::Path, leaf: &str) -> bool {
+    let mut segments = path.segments.iter().rev();
+
+    matches!(
+        (segments.next(), segments.next()),
+        (Some(last), Some(parent)) if last.ident == leaf && parent.ident == "bytemuck"
+    )
 }
 
 /// Convenience macro to define a static public key.
@@ -627,15 +625,12 @@ pub fn pubkey(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 /// based programs.
 #[proc_macro]
 pub fn declare_id(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    #[cfg(feature = "idl-build")]
-    let address = input.clone().to_string();
-
     let id = parse_macro_input!(input as id::Id);
     let ret = quote! { #id };
 
     #[cfg(feature = "idl-build")]
     {
-        let idl_print = anchor_syn::idl::gen_idl_print_fn_address(address);
+        let idl_print = anchor_syn::idl::gen_idl_print_fn_address();
         return proc_macro::TokenStream::from(quote! {
             #ret
             #idl_print
@@ -650,36 +645,25 @@ pub fn declare_id(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
 mod tests {
     use super::*;
 
-    #[allow(clippy::expect_used)]
-    fn zeroed(source: &str) -> bool {
-        let expr = syn::parse_str(source).expect("test expression should parse");
-        is_zeroed_discriminator(&expr)
+    fn namespace_of(input: &str) -> syn::Result<Option<String>> {
+        Ok(syn::parse_str::<AccountArgs>(input)?.namespace)
     }
 
     #[test]
-    fn detects_zeroed_discriminator_literals() {
-        assert!(zeroed("0"));
-        assert!(zeroed("b'\\x00'"));
-        assert!(zeroed("b\"\""));
-        assert!(zeroed("b\"\\x00\\x00\""));
+    fn namespace_literals_use_the_string_value() {
+        let cases = [
+            (r#""abc""#, "abc"),
+            (r#"r"abc""#, "abc"),
+            (r##"r#"abc"#"##, "abc"),
+            (r#""a\"b""#, "a\"b"),
+        ];
 
-        assert!(!zeroed("1"));
-        assert!(!zeroed("b'a'"));
-        assert!(!zeroed("b\"\\x00\\x01\""));
-        assert!(!zeroed("\"\""));
-    }
-
-    #[test]
-    fn detects_zeroed_discriminator_collections() {
-        assert!(zeroed("&[0, (0)]"));
-        assert!(zeroed("[]"));
-        assert!(zeroed("[0; N]"));
-        assert!(zeroed("[1; 0]"));
-        assert!(zeroed("(&b\"\\x00\" )"));
-
-        assert!(!zeroed("&[0, 1]"));
-        assert!(!zeroed("[1; N]"));
-        assert!(!zeroed("MY_DISC"));
-        assert!(!zeroed("get_disc()"));
+        for (input, expected) in cases {
+            assert_eq!(
+                namespace_of(input).unwrap().as_deref(),
+                Some(expected),
+                "namespace from {input}"
+            );
+        }
     }
 }

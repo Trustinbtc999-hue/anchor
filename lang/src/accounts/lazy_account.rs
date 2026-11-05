@@ -1,4 +1,4 @@
-//! Like [`Account`](crate::Account), but deserializes on-demand.
+//! Like [`Account`](crate::accounts::account::Account), but deserializes on-demand.
 
 use {
     crate::{
@@ -54,6 +54,9 @@ use {
 ///   non-inlined, meaning that they're less likely to cause stack violation errors.
 /// - Each individual field can be deserialized with the generated `load_<field>` and
 ///   `load_mut_<field>` methods.
+/// - Changes are serialized on exit if the account is still owned by the
+///   program and has not been closed. If ownership moved during the
+///   instruction, unpersisted changes are an error.
 ///
 /// # Example
 ///

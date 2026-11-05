@@ -1,19 +1,23 @@
+#[cfg_attr(feature = "solana-v3", path = "program/deploy_v3.rs")]
+#[cfg_attr(feature = "solana-v4", path = "program/deploy_v4.rs")]
+mod deploy;
 use {
     crate::{
+        compat::{
+            solana_loader_v3_interface, solana_message, solana_pubkey, solana_rpc_client,
+            solana_rpc_client_api, solana_transaction,
+        },
         config::{Config, Program, WithPath},
-        target_dir, ConfigOverride, ProgramCommand, DEFAULT_MAX_SIGN_ATTEMPTS,
+        metadata::SecurityCommand,
+        redact_url, target_dir, ConfigOverride, ProgramCommand, DEFAULT_MAX_SIGN_ATTEMPTS,
     },
+    anchor_client::Cluster,
     anchor_lang_idl::types::Idl,
     anyhow::{anyhow, bail, Result},
     cargo_metadata::{Metadata, MetadataCommand, Package, TargetKind},
-    solana_cli_config::Config as SolanaCliConfig,
-    solana_client::{
-        connection_cache::ConnectionCache,
-        nonblocking::tpu_client::TpuClient as NonblockingTpuClient,
-        send_and_confirm_transactions_in_parallel::{
-            send_and_confirm_transactions_in_parallel_blocking_v2, SendAndConfirmConfigV2,
-        },
-        tpu_client::TpuClientConfig,
+    deploy::{
+        prepare_write_messages, send_messages_in_batches,
+        simulate_and_update_write_compute_unit_limit,
     },
     solana_commitment_config::CommitmentConfig,
     solana_compute_budget_interface::ComputeBudgetInstruction,
@@ -23,28 +27,23 @@ use {
         instruction::{self as loader_v3_instruction, MINIMUM_EXTEND_PROGRAM_BYTES},
         state::UpgradeableLoaderState,
     },
-    solana_message::{Hash, Message},
-    solana_packet::PACKET_DATA_SIZE,
+    solana_message::{Message, VersionedMessage},
     solana_pubkey::Pubkey,
     solana_rpc_client::rpc_client::RpcClient,
     solana_rpc_client_api::{
         config::{RpcSendTransactionConfig, RpcSimulateTransactionConfig},
         response::RpcSimulateTransactionResult,
     },
-    solana_sdk_ids::{
-        bpf_loader_upgradeable as bpf_loader_upgradeable_id,
-        compute_budget as compute_budget_program_id,
-    },
+    solana_sdk_ids::bpf_loader_upgradeable as bpf_loader_upgradeable_id,
     solana_signature::Signature,
     solana_signer::{EncodableKey, Signer},
     solana_system_interface::MAX_PERMITTED_DATA_LENGTH,
-    solana_transaction::Transaction,
+    solana_transaction::{versioned::VersionedTransaction, Transaction},
     std::{
         collections::{BTreeMap, HashSet},
         fs::{self, File},
-        io::Write,
+        io::{ErrorKind, Write},
         path::{Path, PathBuf},
-        sync::Arc,
         thread,
         time::Duration,
     },
@@ -59,6 +58,20 @@ const WRITE_COMPUTE_UNIT_LIMIT: u32 = 3_000;
 /// Max seconds `wait_for_buffer_stable` polls before giving up and using
 /// the latest snapshot.
 const BUFFER_STABILIZE_MAX_WAIT_SECS: u64 = 60;
+
+/// Error returned when `NO_DNA` disables the destructive confirmation prompt.
+const NO_DNA_PROGRAM_CLOSE_ERROR: &str = "Cannot prompt for confirmation because NO_DNA is set. \
+                                          Re-run with --bypass-warning to close the account.";
+
+fn should_prompt_for_program_close(no_dna_enabled: bool, bypass_warning: bool) -> Result<bool> {
+    if bypass_warning {
+        return Ok(false);
+    }
+    if no_dna_enabled {
+        bail!(NO_DNA_PROGRAM_CLOSE_ERROR);
+    }
+    Ok(true)
+}
 
 /// If `--buffer` is absent, inject a per-program persistent path at
 /// `target/deploy/{program_name}-upgrade-buffer.json`. Creates the keypair
@@ -146,6 +159,12 @@ fn read_buffer_keypair_from_args(args: &[String]) -> Result<Option<Keypair>> {
 pub struct ExistingBuffer {
     pub data: Vec<u8>,
     pub capacity: usize,
+}
+
+struct TransactionSimulationResults {
+    pub compute_units: u32,
+    #[cfg(feature = "solana-v4")]
+    pub loaded_data_size: u32,
 }
 
 /// Fetch buffer body + capacity. `Ok(None)` only when RPC confirms absent; transport errors return `Err`.
@@ -428,6 +447,7 @@ pub fn process_deploy(
     use_rpc: bool,
     verifiable: bool,
     no_idl: bool,
+    security_metadata: bool,
     make_final: bool,
     solana_args: Vec<String>,
 ) -> Result<()> {
@@ -443,7 +463,9 @@ pub fn process_deploy(
             buffer,
             max_len,
             use_rpc,
+            verifiable,
             no_idl,
+            security_metadata,
             make_final,
             solana_args,
         );
@@ -494,6 +516,7 @@ pub fn process_deploy(
             use_rpc,
             verifiable,
             no_idl,
+            security_metadata,
             make_final,
             solana_args,
         );
@@ -510,7 +533,9 @@ pub fn process_deploy(
         buffer,
         max_len,
         use_rpc,
+        verifiable,
         no_idl,
+        security_metadata,
         make_final,
         solana_args,
     )
@@ -525,6 +550,7 @@ fn deploy_workspace(
     use_rpc: bool,
     verifiable: bool,
     no_idl: bool,
+    security_metadata: bool,
     make_final: bool,
     solana_args: Vec<String>,
 ) -> Result<()> {
@@ -536,7 +562,7 @@ fn deploy_workspace(
         // Anchor workspace - we have cluster/wallet config
         let url = crate::cluster_url(&cfg, &cfg.test_validator, &cfg.surfpool_config);
         let keypair = cfg.provider.wallet.to_string();
-        println!("Deploying cluster: {url}");
+        println!("Deploying cluster: {}", redact_url(&url));
         println!("Upgrade authority: {keypair}");
     } else {
         // Cargo workspace - cluster/wallet will come from Solana CLI config or flags
@@ -568,7 +594,9 @@ fn deploy_workspace(
             None, // buffer
             None, // max_len
             use_rpc,
+            verifiable,
             no_idl,
+            security_metadata,
             make_final,
             solana_args.clone(),
         )?;
@@ -590,7 +618,9 @@ pub fn program(cfg_override: &ConfigOverride, cmd: ProgramCommand) -> Result<()>
             buffer,
             max_len,
             use_rpc,
+            verifiable,
             no_idl,
+            security_metadata,
             make_final,
             solana_args,
         } => process_deploy(
@@ -603,8 +633,9 @@ pub fn program(cfg_override: &ConfigOverride, cmd: ProgramCommand) -> Result<()>
             buffer,
             max_len,
             use_rpc,
-            false, // verifiable
+            verifiable,
             no_idl,
+            security_metadata,
             make_final,
             solana_args,
         ),
@@ -710,6 +741,12 @@ fn get_payer_keypair(
     cfg_override: &ConfigOverride,
     config: &Option<WithPath<Config>>,
 ) -> Result<Keypair> {
+    if let Some(wallet) = &cfg_override.wallet {
+        let wallet_path = wallet.to_string();
+        return Keypair::read_from_file(&wallet_path)
+            .map_err(|e| anyhow!("Failed to read wallet keypair from {}: {}", wallet_path, e));
+    }
+
     if let Some(cfg) = config {
         cfg.wallet_kp()
     } else {
@@ -717,6 +754,169 @@ fn get_payer_keypair(
         let (_url, wallet_path) = crate::get_cluster_and_wallet(cfg_override)?;
         Keypair::read_from_file(&wallet_path)
             .map_err(|e| anyhow!("Failed to read wallet keypair from {}: {}", wallet_path, e))
+    }
+}
+
+fn security_metadata_path(config: Option<&WithPath<Config>>) -> Result<PathBuf> {
+    let path = match config {
+        Some(cfg) => cfg
+            .path()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("security.json"),
+        None => std::env::current_dir()?.join("security.json"),
+    };
+
+    let metadata = fs::metadata(&path).map_err(|err| match err.kind() {
+        ErrorKind::NotFound => anyhow!(
+            "`--security-metadata` was requested but `{}` was not found",
+            path.display()
+        ),
+        _ => anyhow!("Failed to inspect `{}`: {}", path.display(), err),
+    })?;
+
+    if !metadata.is_file() {
+        bail!(
+            "`--security-metadata` expected `{}` to be a file",
+            path.display()
+        );
+    }
+
+    let path = path.canonicalize().map_err(|err| {
+        anyhow!(
+            "Failed to canonicalize security metadata path `{}`: {}",
+            path.display(),
+            err
+        )
+    })?;
+
+    let contents =
+        fs::read(&path).map_err(|err| anyhow!("Failed to read `{}`: {}", path.display(), err))?;
+    let value: serde_json::Value = serde_json::from_slice(&contents)
+        .map_err(|err| anyhow!("Failed to parse `{}` as JSON: {}", path.display(), err))?;
+    if !value.is_object() {
+        bail!(
+            "Security metadata in `{}` must be a JSON object",
+            path.display()
+        );
+    }
+
+    if has_default_values(&value)? {
+        bail!(
+            "Security metadata in `{}` still matches the `anchor init` template. Replace the \
+             default fields before uploading with `--security-metadata`",
+            path.display()
+        );
+    }
+
+    Ok(path)
+}
+
+/// Fields a reviewed `security.json` may leave at the `anchor init` default.
+/// These default values can be accepted since they are not unique.
+const SECURITY_TEMPLATE_KEEP: &[&str] = &[
+    "name", // project name
+    "logo",
+    "notification",
+    "preferred_languages",
+    "source_release",
+    "version",
+];
+
+/// True when a field still has the exact `anchor init` template value.
+fn has_default_values(value: &serde_json::Value) -> Result<bool> {
+    let name = value
+        .get("name")
+        .and_then(|name| name.as_str())
+        .unwrap_or("");
+    let template = crate::template::get_security_metadata_content(name);
+    let template = template
+        .as_object()
+        .ok_or_else(|| anyhow!("Failed to get default security.json"))?;
+    let file = value
+        .as_object()
+        .ok_or_else(|| anyhow!("Failed to read security.json from current project"))?;
+
+    for (key, template_value) in template {
+        if SECURITY_TEMPLATE_KEEP.contains(&key.as_str()) {
+            continue;
+        }
+        if file.get(key) == Some(template_value) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn is_mainnet_deploy(cluster: Option<&Cluster>, rpc_client: &RpcClient) -> bool {
+    const MAINNET_GENESIS_HASH: &str = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+
+    match cluster {
+        Some(Cluster::Mainnet) => true,
+        Some(Cluster::Devnet | Cluster::Testnet | Cluster::Localnet | Cluster::Debug) => false,
+        Some(Cluster::Custom(..)) | None => rpc_client
+            .get_genesis_hash()
+            .map(|hash| hash.to_string() == MAINNET_GENESIS_HASH)
+            .unwrap_or(false),
+    }
+}
+
+fn requested_security_metadata_path(
+    requested: bool,
+    config: Option<&WithPath<Config>>,
+) -> Result<Option<PathBuf>> {
+    requested
+        .then(|| security_metadata_path(config))
+        .transpose()
+}
+
+fn upload_security_metadata(
+    cfg_override: &ConfigOverride,
+    security_path: &Path,
+    program_id: Pubkey,
+    upgrade_authority_path: &str,
+    payer_path: Option<String>,
+) -> Result<()> {
+    let (cluster_url, _) = crate::get_cluster_and_wallet(cfg_override)?;
+
+    let security_path = security_path
+        .to_str()
+        .ok_or_else(|| anyhow!("Security metadata filepath is not valid UTF-8"))?
+        .to_string();
+
+    let command = SecurityCommand::Write {
+        program_id: program_id.to_string(),
+        security_path,
+        keypair_path: upgrade_authority_path.to_string(),
+        payer: payer_path,
+        priority_fees: None,
+    };
+
+    if !command.status(&cluster_url)?.success() {
+        bail!("Security metadata upload failed");
+    }
+
+    println!("✓ Security metadata uploaded");
+    Ok(())
+}
+
+/// Resolve the deploy target from the loaded program keypair, treating an
+/// explicit `--program-id` as an assertion that it matches the keypair pubkey.
+fn resolve_program_id(
+    loaded_program_keypair: &Keypair,
+    program_id: Option<Pubkey>,
+) -> Result<Pubkey> {
+    let loaded_program_id = loaded_program_keypair.pubkey();
+    match program_id {
+        Some(expected_program_id) if expected_program_id != loaded_program_id => {
+            bail!(
+                "--program-id {} does not match --program-keypair pubkey {}",
+                expected_program_id,
+                loaded_program_id
+            );
+        }
+        Some(expected_program_id) => Ok(expected_program_id),
+        None => Ok(loaded_program_id),
     }
 }
 
@@ -732,12 +932,17 @@ pub fn program_deploy(
     buffer: Option<Pubkey>,
     max_len: Option<usize>,
     use_rpc: bool,
+    verifiable: bool,
     no_idl: bool,
+    security_metadata: bool,
     make_final: bool,
     solana_args: Vec<String>,
 ) -> Result<()> {
-    let (rpc_client, config) = get_rpc_client_and_config(cfg_override)?;
-    let payer = get_payer_keypair(cfg_override, &config)?;
+    if program_id.is_some() && program_keypair.is_none() {
+        return Err(anyhow!(
+            "When --program-id is specified, --program-keypair must also be provided"
+        ));
+    }
 
     // Determine the program filepath
     let program_filepath = if let Some(filepath) = program_filepath {
@@ -748,17 +953,16 @@ pub fn program_deploy(
         let programs = get_programs_from_workspace(cfg_override, program_name.clone())?;
 
         let program = &programs[0];
-        let binary_path = program.binary_path(false)?; // false = not verifiable build
+        let binary_path = program.binary_path(verifiable)?;
 
         println!("Deploying program: {}", program.lib_name);
 
         binary_path
     };
 
-    // Determine program keypair (loaded before fee discovery so program_id can
-    // scope the recent-prioritization-fees query to this program's contention).
+    // Load the keypair and reject a mismatched --program-id before any cluster
+    // connection. The same keypair signs a fresh deploy later.
     let loaded_program_keypair = if let Some(keypair_path) = program_keypair {
-        // Load from specified keypair file
         Keypair::read_from_file(&keypair_path).map_err(|e| {
             anyhow!(
                 "Failed to read program keypair from {}: {}",
@@ -766,10 +970,6 @@ pub fn program_deploy(
                 e
             )
         })?
-    } else if let Some(_program_id) = program_id {
-        return Err(anyhow!(
-            "When --program-id is specified, --program-keypair must also be provided"
-        ));
     } else {
         // Auto-detect from target/deploy/{program_name}-keypair.json
         let program_name = Path::new(&program_filepath)
@@ -789,8 +989,23 @@ pub fn program_deploy(
             )
         })?
     };
+    let program_id = resolve_program_id(&loaded_program_keypair, program_id)?;
 
-    let program_id = loaded_program_keypair.pubkey();
+    let (rpc_client, config) = get_rpc_client_and_config(cfg_override)?;
+    let payer = get_payer_keypair(cfg_override, &config)?;
+    // Resolve requested metadata before performing any on-chain mutations.
+    let security_path = requested_security_metadata_path(security_metadata, config.as_ref())?;
+    if security_path.is_none()
+        && is_mainnet_deploy(
+            config.as_ref().map(|cfg| &cfg.provider.cluster),
+            &rpc_client,
+        )
+    {
+        eprintln!(
+            "Warning: deploying to mainnet without `--security-metadata`. Publish a reviewed \
+             `security.json` with `anchor program deploy --security-metadata`."
+        );
+    }
 
     // Inject per-program --buffer keypair so retries
     // within and across runs share the same on-chain buffer.
@@ -823,17 +1038,19 @@ pub fn program_deploy(
         )
     })?;
 
-    // Determine upgrade authority
-    let upgrade_authority = if let Some(auth_path) = upgrade_authority {
+    // Determine upgrade authority. The path is the same choice, kept for the
+    // security-metadata upload which takes a keypair file rather than a signer.
+    let (_cluster_url, wallet_path) = crate::get_cluster_and_wallet(cfg_override)?;
+    let (upgrade_authority, upgrade_authority_path) = if let Some(auth_path) = upgrade_authority {
         let authority_keypair = Keypair::read_from_file(&auth_path)
             .map_err(|e| anyhow!("Failed to read upgrade authority keypair: {}", e))?;
         println!(
             "Using custom upgrade authority: {}",
             authority_keypair.pubkey()
         );
-        authority_keypair
+        (authority_keypair, auth_path)
     } else {
-        payer.insecure_clone()
+        (payer.insecure_clone(), wallet_path.clone())
     };
 
     // Check if program already exists → decides deploy vs upgrade path
@@ -942,7 +1159,7 @@ pub fn program_deploy(
                     &rpc_client,
                     &payer,
                     &program_data,
-                    &upgrade_authority.pubkey(),
+                    &upgrade_authority,
                     kp,
                     CommitmentConfig::confirmed(),
                     send_config,
@@ -1095,6 +1312,17 @@ pub fn program_deploy(
                 idl_filepath.display()
             );
         }
+    }
+
+    if let Some(security_path) = security_path {
+        let payer_path = (payer.pubkey() != upgrade_authority.pubkey()).then_some(wallet_path);
+        upload_security_metadata(
+            cfg_override,
+            &security_path,
+            program_id,
+            &upgrade_authority_path,
+            payer_path,
+        )?;
     }
 
     // Make program immutable if --final flag is set
@@ -1530,7 +1758,7 @@ fn program_write_buffer(
         &rpc_client,
         &payer,
         &program_data,
-        &buffer_authority_keypair.pubkey(),
+        &buffer_authority_keypair,
         &buffer_keypair,
         CommitmentConfig::confirmed(),
         RpcSendTransactionConfig {
@@ -1989,7 +2217,7 @@ pub fn program_upgrade(
                 &rpc_client,
                 &payer,
                 &program_data,
-                &upgrade_authority_keypair.pubkey(),
+                &upgrade_authority_keypair,
                 &buffer_keypair,
                 CommitmentConfig::confirmed(),
                 send_config,
@@ -2180,7 +2408,7 @@ fn program_close(
     // Determine recipient
     let recipient_pubkey = recipient.unwrap_or_else(|| authority_keypair.pubkey());
 
-    if !bypass_warning {
+    if should_prompt_for_program_close(crate::no_dna_enabled(), bypass_warning)? {
         println!();
         println!(
             "WARNING: This will close the {} account and reclaim all lamports.",
@@ -2370,43 +2598,32 @@ fn program_extend(
     Ok(())
 }
 
-// ========== Agave's core parallel deployment functions ==========
-
-pub fn calculate_max_chunk_size(baseline_msg: Message) -> usize {
-    let tx_size = bincode::serialized_size(&Transaction {
-        signatures: vec![
-            Signature::default();
-            baseline_msg.header.num_required_signatures as usize
-        ],
-        message: baseline_msg,
-    })
-    .unwrap() as usize;
-    // add 1 byte buffer to account for shortvec encoding
-    PACKET_DATA_SIZE.saturating_sub(tx_size).saturating_sub(1)
-}
-
-fn set_compute_unit_limit_ix_data(message: &mut Message, ix_index: usize, compute_unit_limit: u32) {
-    let ix = &mut message.instructions[ix_index];
-    let program_id = message.account_keys[ix.program_id_index as usize];
-    assert_eq!(program_id, compute_budget_program_id::id());
-    ix.data = ComputeBudgetInstruction::set_compute_unit_limit(compute_unit_limit).data;
-}
-
 fn simulate_write_compute_unit_limit(
     rpc_client: &RpcClient,
-    message: &Message,
+    message: &VersionedMessage,
     fee_payer_signer: &dyn Signer,
     write_signer: &dyn Signer,
-) -> Result<u32> {
+) -> Result<TransactionSimulationResults> {
     let blockhash = rpc_client.get_latest_blockhash()?;
+
     let mut message = message.clone();
-    message.recent_blockhash = blockhash;
-    let mut transaction = Transaction::new_unsigned(message);
-    transaction.try_sign(&[fee_payer_signer, write_signer], blockhash)?;
+    if let VersionedMessage::Legacy(msg) = &mut message {
+        msg.recent_blockhash = blockhash;
+    };
+
+    let signers = if fee_payer_signer.pubkey() == write_signer.pubkey() {
+        vec![fee_payer_signer]
+    } else {
+        vec![fee_payer_signer, write_signer]
+    };
+
+    let transaction = VersionedTransaction::try_new(message, signers.as_slice())?;
 
     let RpcSimulateTransactionResult {
         err,
         units_consumed,
+        #[cfg(feature = "solana-v4")]
+        loaded_accounts_data_size,
         ..
     } = rpc_client
         .simulate_transaction_with_config(
@@ -2426,51 +2643,27 @@ fn simulate_write_compute_unit_limit(
 
     let units_consumed = units_consumed
         .ok_or_else(|| anyhow!("Write transaction simulation did not return units_consumed"))?;
-    units_consumed
-        .try_into()
-        .map_err(|_| anyhow!("Simulated write CU limit exceeds u32"))
-}
 
-fn simulate_and_update_write_compute_unit_limit(
-    rpc_client: &RpcClient,
-    mut write_messages: Vec<Message>,
-    fee_payer_signer: &dyn Signer,
-    write_signer: &dyn Signer,
-) -> Result<Vec<Message>> {
-    if write_messages.is_empty() {
-        return Ok(write_messages);
-    }
+    #[cfg(feature = "solana-v4")]
+    let loaded_accounts_data_size = loaded_accounts_data_size
+        .ok_or_else(|| anyhow!("Write transaction simulation did not return units_consumed"))?;
 
-    let compute_unit_limit_ix_index = usize::from(write_messages[0].instructions.len() == 3);
-    let compute_unit_limit = match simulate_write_compute_unit_limit(
-        rpc_client,
-        &write_messages[0],
-        fee_payer_signer,
-        write_signer,
-    ) {
-        Ok(compute_unit_limit) => compute_unit_limit,
-        Err(err) => {
-            eprintln!(
-                "Note: write transaction simulation failed ({}); keeping placeholder compute unit \
-                 limit.",
-                err
-            );
-            return Ok(write_messages);
-        }
-    };
+    Ok(TransactionSimulationResults {
+        compute_units: units_consumed
+            .try_into()
+            .map_err(|_| anyhow!("Simulated write CU limit exceeds u32"))?,
 
-    for message in &mut write_messages {
-        set_compute_unit_limit_ix_data(message, compute_unit_limit_ix_index, compute_unit_limit);
-    }
-
-    Ok(write_messages)
+        #[cfg(feature = "solana-v4")]
+        loaded_data_size: loaded_accounts_data_size,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn send_deploy_messages(
     rpc_client: &RpcClient,
     initial_message: Option<Message>,
-    mut write_messages: Vec<Message>,
+    #[cfg(feature = "solana-v4")] mut write_messages: Vec<VersionedMessage>,
+    #[cfg(feature = "solana-v3")] mut write_messages: Vec<Message>,
     final_message: Option<Message>,
     fee_payer_signer: &dyn Signer,
     initial_signer: Option<&dyn Signer>,
@@ -2524,7 +2717,10 @@ pub fn send_deploy_messages(
 
             send_messages_in_batches(
                 rpc_client,
+                #[cfg(feature = "solana-v3")]
                 &write_messages,
+                #[cfg(feature = "solana-v4")]
+                write_messages,
                 &[fee_payer_signer, write_signer],
                 max_sign_attempts,
                 use_rpc,
@@ -2565,7 +2761,7 @@ pub fn write_program_buffer(
     rpc_client: &RpcClient,
     payer: &dyn Signer,
     program_data: &[u8],
-    buffer_authority: &Pubkey,
+    buffer_authority: &dyn Signer,
     buffer_keypair: &dyn Signer,
     commitment: CommitmentConfig,
     send_transaction_config: RpcSendTransactionConfig,
@@ -2592,7 +2788,7 @@ pub fn write_program_buffer(
         let create_ixs = loader_v3_instruction::create_buffer(
             &payer.pubkey(),
             &buffer_pubkey,
-            buffer_authority,
+            &buffer_authority.pubkey(),
             min_balance,
             buffer_len,
         )
@@ -2620,7 +2816,7 @@ pub fn write_program_buffer(
     let write_messages = prepare_write_messages(
         program_data,
         &buffer_pubkey,
-        buffer_authority,
+        &buffer_authority.pubkey(),
         &payer.pubkey(),
         &blockhash,
         priority_fee,
@@ -2634,7 +2830,7 @@ pub fn write_program_buffer(
         None,
         payer,
         Some(buffer_keypair),
-        Some(payer),
+        Some(buffer_authority),
         None,
         max_sign_attempts,
         use_rpc,
@@ -2644,150 +2840,111 @@ pub fn write_program_buffer(
     Ok(buffer_pubkey)
 }
 
-/// Prepare write messages. When `existing_buffer_data` is provided, skip
-/// chunks that already match on-chain bytes — letting resume after a failed
-/// deploy only re-send the chunks that didn't land.
-fn prepare_write_messages(
-    program_data: &[u8],
-    buffer_pubkey: &Pubkey,
-    buffer_authority: &Pubkey,
-    fee_payer: &Pubkey,
-    blockhash: &Hash,
-    priority_fee: Option<u64>,
-    existing_buffer_data: Option<&[u8]>,
-) -> Vec<Message> {
-    let create_msg = |offset: u32, bytes: Vec<u8>| {
-        let mut instructions: Vec<Instruction> = Vec::with_capacity(3);
-        if let Some(price) = priority_fee {
-            if price > 0 {
-                instructions.push(ComputeBudgetInstruction::set_compute_unit_price(price));
-            }
-        }
-        instructions.push(ComputeBudgetInstruction::set_compute_unit_limit(
-            WRITE_COMPUTE_UNIT_LIMIT,
-        ));
-        instructions.push(loader_v3_instruction::write(
-            buffer_pubkey,
-            buffer_authority,
-            offset,
-            bytes,
-        ));
-        Message::new_with_blockhash(&instructions, Some(fee_payer), blockhash)
-    };
-
-    let mut write_messages = Vec::new();
-    let chunk_size = calculate_max_chunk_size(create_msg(0, Vec::new()));
-
-    for (chunk, i) in program_data.chunks(chunk_size).zip(0usize..) {
-        let offset = i.saturating_mul(chunk_size);
-        let already_written = match existing_buffer_data {
-            Some(existing) => {
-                let end = offset.saturating_add(chunk.len());
-                end <= existing.len() && &existing[offset..end] == chunk
-            }
-            None => false,
-        };
-        if !already_written {
-            write_messages.push(create_msg(offset as u32, chunk.to_vec()));
-        }
-    }
-
-    write_messages
-}
-
-/// Send messages in parallel
-fn send_messages_in_batches(
-    rpc_client: &RpcClient,
-    messages: &[Message],
-    signers: &[&dyn Signer],
-    max_sign_attempts: usize,
-    use_rpc: bool,
-    commitment: CommitmentConfig,
-    send_config: RpcSendTransactionConfig,
-) -> Result<()> {
-    // Use parallel send and confirm function
-    // Create a new RpcClient with the same URL and wrap in Arc for parallel processing
-    let url = rpc_client.url();
-    let new_rpc_client = RpcClient::new_with_commitment(url.clone(), commitment);
-    let rpc_client_arc = Arc::new(new_rpc_client);
-
-    // Construct a TPU client so chunk writes go directly to validator leaders
-    // via QUIC, bypassing the RPC node's send path.
-    //
-    // Failure-tolerant: if TPU construction errors (firewall blocks QUIC,
-    // websocket unreachable, etc.) we fall back to `None` and the parallel
-    // sender uses the RpcClient — slower but functional.
-    let tpu_client = if use_rpc {
-        None
-    } else {
-        let ws_url = SolanaCliConfig::compute_websocket_url(&url);
-        if ws_url.is_empty() {
-            None
-        } else {
-            match ConnectionCache::new_quic("anchor_program_deploy_tpu", 1) {
-                ConnectionCache::Quic(cache_inner) => {
-                    let inner_rpc = rpc_client_arc.get_inner_client().clone();
-                    let fut = NonblockingTpuClient::new_with_connection_cache(
-                        inner_rpc,
-                        &ws_url,
-                        TpuClientConfig::default(),
-                        cache_inner,
-                    );
-                    match rpc_client_arc.runtime().block_on(fut) {
-                        Ok(client) => Some(client),
-                        Err(e) => {
-                            eprintln!(
-                                "Note: TPU client construction failed ({}); falling back to RPC \
-                                 for chunk writes. This is slower but functional.",
-                                e
-                            );
-                            None
-                        }
-                    }
-                }
-                ConnectionCache::Udp(_) => None,
-            }
-        }
-    };
-
-    let transaction_errors = send_and_confirm_transactions_in_parallel_blocking_v2(
-        rpc_client_arc,
-        tpu_client,
-        messages,
-        signers,
-        SendAndConfirmConfigV2 {
-            resign_txs_count: Some(max_sign_attempts),
-            with_spinner: true,
-            rpc_send_transaction_config: send_config,
-        },
-    )
-    .map_err(|err| anyhow!("Data writes to account failed: {}", err))?
-    .into_iter()
-    .flatten()
-    // Drop AlreadyProcessed — tx landed via TPU fanout
-    .filter(|e| format!("{:?}", e) != "AlreadyProcessed")
-    .collect::<Vec<_>>();
-
-    if !transaction_errors.is_empty() {
-        for transaction_error in &transaction_errors {
-            eprintln!("{:?}", transaction_error);
-        }
-        return Err(anyhow!(
-            "{} write transactions failed",
-            transaction_errors.len()
-        ));
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use {
         super::*,
-        std::{collections::BTreeSet, fs, path::Path},
+        std::{
+            collections::BTreeSet,
+            fs,
+            path::{Path, PathBuf},
+        },
         tempfile::tempdir,
     };
+
+    #[test]
+    fn resolve_program_id_accepts_matching_keypair() {
+        let program_keypair = Keypair::new();
+        let expected_program_id = program_keypair.pubkey();
+
+        let program_id = resolve_program_id(&program_keypair, Some(expected_program_id)).unwrap();
+
+        assert_eq!(program_id, expected_program_id);
+    }
+
+    #[test]
+    fn resolve_program_id_rejects_mismatching_keypair() {
+        let program_keypair = Keypair::new();
+        let expected_program_id = Pubkey::new_unique();
+
+        let err = resolve_program_id(&program_keypair, Some(expected_program_id))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains(&format!(
+            "--program-id {} does not match --program-keypair pubkey {}",
+            expected_program_id,
+            program_keypair.pubkey()
+        )));
+    }
+
+    #[test]
+    fn program_deploy_rejects_mismatching_program_id_before_deploy() {
+        let dir = tempdir().unwrap();
+        let keypair_path = dir.path().join("program-keypair.json");
+        let program_keypair = Keypair::new();
+        program_keypair.write_to_file(&keypair_path).unwrap();
+        let mismatching_program_id = Pubkey::new_unique();
+
+        let err = program_deploy(
+            &ConfigOverride {
+                cluster: None,
+                wallet: None,
+                commitment: None,
+            },
+            Some(dir.path().join("program.so")),
+            None,
+            Some(keypair_path),
+            None,
+            Some(mismatching_program_id),
+            None,
+            None,
+            false,
+            false,
+            true,
+            false,
+            false,
+            vec![],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains(&format!(
+            "--program-id {} does not match --program-keypair pubkey {}",
+            mismatching_program_id,
+            program_keypair.pubkey()
+        )));
+    }
+
+    #[test]
+    fn program_deploy_rejects_program_id_without_program_keypair() {
+        let err = program_deploy(
+            &ConfigOverride {
+                cluster: None,
+                wallet: None,
+                commitment: None,
+            },
+            Some(PathBuf::from("program.so")),
+            None,
+            None,
+            None,
+            Some(Pubkey::new_unique()),
+            None,
+            None,
+            false,
+            false,
+            true,
+            false,
+            false,
+            vec![],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("When --program-id is specified, --program-keypair must also be provided")
+        );
+    }
 
     fn write_file(path: &Path, contents: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2924,5 +3081,108 @@ resolver = "2"
             adjust_extend_bytes(1, MAX_PERMITTED_DATA_LENGTH as usize),
             1
         );
+    }
+    #[test]
+    fn security_metadata_path_uses_workspace_root() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("security.json"), "{\"name\":\"demo\"}").unwrap();
+        let cfg = WithPath::new(Config::default(), dir.path().join("Anchor.toml"));
+
+        let path = security_metadata_path(Some(&cfg)).unwrap();
+
+        assert_eq!(
+            path,
+            dir.path().join("security.json").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn security_metadata_path_requires_existing_file() {
+        let dir = tempdir().unwrap();
+        let cfg = WithPath::new(Config::default(), dir.path().join("Anchor.toml"));
+
+        let err = security_metadata_path(Some(&cfg)).unwrap_err().to_string();
+
+        assert!(err.contains("--security-metadata"));
+        assert!(err.contains("security.json"));
+    }
+
+    #[test]
+    fn security_metadata_path_rejects_invalid_json() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("security.json"), "{\"name\":").unwrap();
+        let cfg = WithPath::new(Config::default(), dir.path().join("Anchor.toml"));
+
+        let err = security_metadata_path(Some(&cfg)).unwrap_err().to_string();
+
+        assert!(err.contains("Failed to parse"));
+        assert!(err.contains("security.json"));
+    }
+
+    #[test]
+    fn security_metadata_path_requires_json_object() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("security.json"), "[]").unwrap();
+        let cfg = WithPath::new(Config::default(), dir.path().join("Anchor.toml"));
+
+        let err = security_metadata_path(Some(&cfg)).unwrap_err().to_string();
+
+        assert!(err.contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn security_metadata_path_rejects_template_placeholders() {
+        let dir = tempdir().unwrap();
+        let template = crate::template::get_security_metadata_content("counter");
+        fs::write(
+            dir.path().join("security.json"),
+            serde_json::to_vec(&template).unwrap(),
+        )
+        .unwrap();
+        let cfg = WithPath::new(Config::default(), dir.path().join("Anchor.toml"));
+
+        let err = security_metadata_path(Some(&cfg)).unwrap_err().to_string();
+
+        assert!(err.contains("anchor init"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn security_metadata_path_rejects_partially_edited_template() {
+        let dir = tempdir().unwrap();
+        let mut template = crate::template::get_security_metadata_content("counter");
+        template["description"] = serde_json::json!("reviewed-description");
+        fs::write(
+            dir.path().join("security.json"),
+            serde_json::to_vec(&template).unwrap(),
+        )
+        .unwrap();
+        let cfg = WithPath::new(Config::default(), dir.path().join("Anchor.toml"));
+
+        let err = security_metadata_path(Some(&cfg)).unwrap_err().to_string();
+
+        assert!(err.contains("anchor init"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn unrequested_security_metadata_does_not_require_file() {
+        let dir = tempdir().unwrap();
+        let cfg = WithPath::new(Config::default(), dir.path().join("Anchor.toml"));
+
+        assert_eq!(
+            requested_security_metadata_path(false, Some(&cfg)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn program_close_requires_explicit_bypass_under_no_dna() {
+        let err = should_prompt_for_program_close(true, false).unwrap_err();
+        assert!(
+            err.to_string().contains("--bypass-warning"),
+            "unexpected error: {err}"
+        );
+
+        assert!(!should_prompt_for_program_close(true, true).unwrap());
+        assert!(should_prompt_for_program_close(false, false).unwrap());
     }
 }

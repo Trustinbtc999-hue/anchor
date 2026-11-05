@@ -1,5 +1,8 @@
 use {
-    crate::{get_keypair, is_hidden, keys_sync, target_dir, AbsolutePath, DEFAULT_RPC_PORT},
+    crate::{
+        compat::{solana_cli_config, solana_clock, solana_pubkey},
+        get_keypair, is_hidden, keys_sync, target_dir, AbsolutePath, DEFAULT_RPC_PORT,
+    },
     anchor_client::Cluster,
     anchor_lang_idl::types::Idl,
     anyhow::{anyhow, bail, Context, Error, Result},
@@ -423,7 +426,7 @@ impl std::fmt::Display for PackageManager {
 pub struct FeaturesConfig {
     /// Enable account resolution.
     ///
-    /// Not able to specify default bool value: https://github.com/serde-rs/serde/issues/368
+    /// Not able to specify default bool value: <https://github.com/serde-rs/serde/issues/368>
     #[serde(default = "FeaturesConfig::get_default_resolution")]
     pub resolution: bool,
     /// Disable safety comment checks
@@ -815,9 +818,13 @@ struct Provider {
 fn ser_cluster<S: Serializer>(cluster: &Cluster, s: S) -> Result<S::Ok, S::Error> {
     match cluster {
         Cluster::Custom(http, ws) => {
-            match (Url::parse(http), Url::parse(ws)) {
+            match (http.parse::<Cluster>(), Url::parse(ws)) {
                 // If `ws` was derived from `http`, serialize `http` as string
-                (Ok(h), Ok(w)) if h.domain() == w.domain() => s.serialize_str(http),
+                (Ok(Cluster::Custom(_, derived)), Ok(w))
+                    if Url::parse(&derived).ok().as_ref() == Some(&w) =>
+                {
+                    s.serialize_str(http)
+                }
                 _ => {
                     let mut map = s.serialize_map(Some(2))?;
                     map.serialize_entry("http", http)?;
@@ -1249,28 +1256,22 @@ impl _TestToml {
     }
 }
 
-/// canonicalizes the `file_path` arg.
-/// uses the `path` arg as the current dir
-/// from which to turn the relative path
-/// into a canonical one
+/// Canonicalizes `file_path` relative to the directory containing `origin`.
 fn canonicalize_filepath_from_origin(
     file_path: impl AsRef<Path>,
     origin: impl AsRef<Path>,
 ) -> Result<String> {
-    let previous_dir = std::env::current_dir()?;
-    std::env::set_current_dir(origin.as_ref().parent().unwrap())?;
-    let result = fs::canonicalize(&file_path)
+    let result = fs::canonicalize(origin.as_ref().parent().unwrap().join(&file_path))
         .with_context(|| {
             format!(
-                "Error reading (possibly relative) path: {}. If relative, this is the path that \
-                 was used as the current path: {}",
+                "Error reading (possibly relative) path: {}. If relative, this path is resolved \
+                 relative to the directory containing: {}",
                 file_path.as_ref().display(),
                 origin.as_ref().display()
             )
         })?
         .display()
         .to_string();
-    std::env::set_current_dir(previous_dir)?;
     Ok(result)
 }
 
@@ -1304,11 +1305,24 @@ impl Merge for _TestToml {
         let mut my_test = self.test.take();
         match &mut my_test {
             Some(my_test) => {
-                if let Some(other_test) = other.test {
-                    if let Some(startup_wait) = other_test.startup_wait {
+                if let Some(_TestValidator {
+                    genesis: other_genesis,
+                    validator: other_validator,
+                    startup_wait,
+                    shutdown_wait,
+                    upgradeable,
+                }) = other.test
+                {
+                    if let Some(startup_wait) = startup_wait {
                         my_test.startup_wait = Some(startup_wait);
                     }
-                    if let Some(other_genesis) = other_test.genesis {
+                    if let Some(shutdown_wait) = shutdown_wait {
+                        my_test.shutdown_wait = Some(shutdown_wait);
+                    }
+                    if let Some(upgradeable) = upgradeable {
+                        my_test.upgradeable = Some(upgradeable);
+                    }
+                    if let Some(other_genesis) = other_genesis {
                         match &mut my_test.genesis {
                             Some(my_genesis) => {
                                 for other_entry in other_genesis {
@@ -1326,9 +1340,9 @@ impl Merge for _TestToml {
                     }
                     let mut my_validator = my_test.validator.take();
                     match &mut my_validator {
-                        None => my_validator = other_test.validator,
+                        None => my_validator = other_validator,
                         Some(my_validator) => {
-                            if let Some(other_validator) = other_test.validator {
+                            if let Some(other_validator) = other_validator {
                                 my_validator.merge(other_validator)
                             }
                         }
@@ -2004,6 +2018,48 @@ mod tests {
         assert!(!config.features.skip_lint);
     }
 
+    fn round_trip_custom_cluster(http: &str, ws: &str) -> (String, Cluster) {
+        let config = Config::from_str(&format!(
+            "
+        [provider]
+        cluster = {{ http = \"{http}\", ws = \"{ws}\" }}
+        wallet = \"id.json\"
+    "
+        ))
+        .unwrap();
+        let serialized = config.to_string();
+        let reparsed = Config::from_str(&serialized).unwrap();
+        (serialized, reparsed.provider.cluster)
+    }
+
+    #[test]
+    fn custom_cluster_keeps_ws_with_same_domain_different_path() {
+        let (_, cluster) =
+            round_trip_custom_cluster("https://rpc.example.com", "wss://rpc.example.com/ws");
+        assert_eq!(cluster.ws_url(), "wss://rpc.example.com/ws");
+    }
+
+    #[test]
+    fn custom_cluster_keeps_ws_with_same_domain_different_port() {
+        let (_, cluster) =
+            round_trip_custom_cluster("https://rpc.example.com", "wss://rpc.example.com:9000");
+        assert_eq!(cluster.ws_url(), "wss://rpc.example.com:9000");
+    }
+
+    #[test]
+    fn custom_cluster_keeps_ws_with_different_ip_host() {
+        let (_, cluster) = round_trip_custom_cluster("http://127.0.0.1:8899", "ws://10.0.0.5:9999");
+        assert_eq!(cluster.ws_url(), "ws://10.0.0.5:9999");
+    }
+
+    #[test]
+    fn custom_cluster_with_derived_ws_serializes_as_string() {
+        let (serialized, cluster) =
+            round_trip_custom_cluster("http://127.0.0.1:8899", "ws://127.0.0.1:8900");
+        assert!(serialized.contains(r#"cluster = "http://127.0.0.1:8899""#));
+        assert_eq!(cluster.ws_url(), "ws://127.0.0.1:8900/");
+    }
+
     #[test]
     fn parse_skip_lint_no_section() {
         let config = Config::from_str(BASE_CONFIG).unwrap();
@@ -2145,6 +2201,119 @@ amount = 2
         assert_eq!(token_accounts.len(), 2);
         assert_eq!(token_accounts[0].amount, 1);
         assert_eq!(token_accounts[1].amount, 2);
+    }
+
+    #[test]
+    fn test_toml_extends_overrides_shutdown_wait_and_upgradeable() {
+        let dir = tempfile::tempdir().unwrap();
+        let suite_dir = dir.path().join("tests").join("suite");
+        fs::create_dir_all(&suite_dir).unwrap();
+
+        fs::write(
+            suite_dir.join("Base.toml"),
+            r#"
+[test]
+startup_wait = 1000
+shutdown_wait = 1000
+upgradeable = false
+"#,
+        )
+        .unwrap();
+
+        let test_toml = suite_dir.join("Test.toml");
+        fs::write(
+            &test_toml,
+            r#"
+extends = ["Base.toml"]
+
+[scripts]
+test = "true"
+
+[test]
+shutdown_wait = 2000
+upgradeable = true
+"#,
+        )
+        .unwrap();
+
+        let test = TestToml::from_path(test_toml).unwrap().test.unwrap();
+        assert_eq!(test.startup_wait, 1000);
+        assert_eq!(test.shutdown_wait, 2000);
+        assert!(test.upgradeable);
+    }
+
+    #[test]
+    fn test_toml_extends_keeps_base_shutdown_wait_and_upgradeable() {
+        let dir = tempfile::tempdir().unwrap();
+        let suite_dir = dir.path().join("tests").join("suite");
+        fs::create_dir_all(&suite_dir).unwrap();
+
+        fs::write(
+            suite_dir.join("Base.toml"),
+            r#"
+[test]
+shutdown_wait = 1000
+upgradeable = true
+"#,
+        )
+        .unwrap();
+
+        let test_toml = suite_dir.join("Test.toml");
+        fs::write(
+            &test_toml,
+            r#"
+extends = ["Base.toml"]
+
+[scripts]
+test = "true"
+
+[test]
+startup_wait = 3000
+"#,
+        )
+        .unwrap();
+
+        let test = TestToml::from_path(test_toml).unwrap().test.unwrap();
+        assert_eq!(test.startup_wait, 3000);
+        assert_eq!(test.shutdown_wait, 1000);
+        assert!(test.upgradeable);
+    }
+
+    #[test]
+    fn test_toml_extends_overrides_with_zero_shutdown_wait_and_not_upgradeable() {
+        let dir = tempfile::tempdir().unwrap();
+        let suite_dir = dir.path().join("tests").join("suite");
+        fs::create_dir_all(&suite_dir).unwrap();
+
+        fs::write(
+            suite_dir.join("Base.toml"),
+            r#"
+[test]
+shutdown_wait = 1000
+upgradeable = true
+"#,
+        )
+        .unwrap();
+
+        let test_toml = suite_dir.join("Test.toml");
+        fs::write(
+            &test_toml,
+            r#"
+extends = ["Base.toml"]
+
+[scripts]
+test = "true"
+
+[test]
+shutdown_wait = 0
+upgradeable = false
+"#,
+        )
+        .unwrap();
+
+        let test = TestToml::from_path(test_toml).unwrap().test.unwrap();
+        assert_eq!(test.shutdown_wait, 0);
+        assert!(!test.upgradeable);
     }
 
     #[test]
